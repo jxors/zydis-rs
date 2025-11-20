@@ -100,12 +100,73 @@ impl Decoder {
         &'this self,
         buffer: &'buffer [u8],
         ip: u64,
-    ) -> InstructionIter<'this, 'buffer, O> {
+    ) -> impl Iterator<Item = Result<(u64, &'buffer [u8], Instruction<O>)>> + use<'buffer, 'this, O> {
         InstructionIter {
             decoder: self,
             buffer,
             ip,
+            sealed: false,
+            handle_error: |_: IterState| (),
             _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over all the instructions in the buffer.
+    ///
+    /// If you don't know the instruction pointer or simply want to track the
+    /// current offset within the input buffer, pass `0` as `ip`.
+    /// 
+    /// When a decoding error occurs, `handle_error` is called.
+    /// It receives a [`IterState`], which can be used to recover from the error by advancing a certain number of bytes in the input.
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// let decoder = Decoder::new64();
+    /// for instr in decoder.decode_all_with::<VisibleOperands>(&[ 0x06, 0x50 ], 0, |s| s.skip_byte()) {
+    ///     println!("{instr:?}")
+    /// }
+    /// ```
+    #[inline]
+    pub fn decode_all_with<'this, 'buffer, O: Operands, F: FnMut(IterState<'_, 'buffer>)>(
+        &'this self,
+        buffer: &'buffer [u8],
+        ip: u64,
+        handle_error: F,
+    ) -> InstructionIter<'this, 'buffer, O, F> {
+        InstructionIter {
+            decoder: self,
+            buffer,
+            ip,
+            sealed: false,
+            handle_error,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// See [`Decoder::decode_all_with`]
+pub struct IterState<'r, 'buffer> {
+    buffer: &'r mut &'buffer [u8],
+    ip: &'r mut u64,
+    sealed: &'r mut bool,
+}
+
+impl IterState<'_, '_> {
+    /// Advances one byte and continues decoding.
+    pub fn skip_byte(self) {
+        self.skip_bytes(1)
+    }
+
+    /// Advances `num` bytes and continues decoding.
+    pub fn skip_bytes(self, num: u64) {
+        let num = num.min(self.buffer.len() as u64);
+
+        // Skipping 0 bytes would result in an infinite loop.
+        if num > 0 {
+            *self.ip += num;
+            *self.buffer = &self.buffer[num as usize..];
+            *self.sealed = false;
         }
     }
 }
@@ -114,18 +175,24 @@ impl Decoder {
 ///
 /// Created via [`Decoder::decode_all`].
 #[derive(Clone)]
-pub struct InstructionIter<'decoder, 'buffer, O: Operands> {
+pub struct InstructionIter<'decoder, 'buffer, O: Operands, F> {
     decoder: &'decoder Decoder,
     buffer: &'buffer [u8],
+    handle_error: F,
     ip: u64,
+    sealed: bool,
     _marker: PhantomData<*const O>,
 }
 
-impl<'decoder, 'buffer, O: Operands> Iterator for InstructionIter<'decoder, 'buffer, O> {
+impl<'decoder, 'buffer, O: Operands, F: FnMut(IterState<'_, 'buffer>)> Iterator for InstructionIter<'decoder, 'buffer, O, F> {
     type Item = Result<(u64, &'buffer [u8], Instruction<O>)>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        if self.sealed {
+            return None
+        }
+
         match self.decoder.decode_first(self.buffer) {
             Ok(Some(insn)) => {
                 let ip = self.ip;
@@ -135,7 +202,16 @@ impl<'decoder, 'buffer, O: Operands> Iterator for InstructionIter<'decoder, 'buf
                 Some(Ok((ip, insn_bytes, insn)))
             }
             Ok(None) => None,
-            Err(e) => Some(Err(e)),
+            Err(e) => {
+                self.sealed = true;
+                (self.handle_error)(IterState {
+                    ip: &mut self.ip,
+                    sealed: &mut self.sealed,
+                    buffer: &mut self.buffer,
+                });
+
+                Some(Err(e))
+            },
         }
     }
 }
@@ -371,5 +447,46 @@ impl<const MAX_OPERANDS: usize> fmt::Debug for OperandArrayVec<MAX_OPERANDS> {
         f.debug_tuple("OperandArrayVec")
             .field(&self.operands())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::VisibleOperands;
+
+    use super::Decoder;
+
+    #[test]
+    fn decode_all_terminates() {
+        let decoder = Decoder::new64();
+        let mut iter = decoder.decode_all::<VisibleOperands>(&[ 0x06 ], 0);
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
+
+        let mut iter = decoder.decode_all::<VisibleOperands>(&[ 0x50, 0x06 ], 0);
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn decode_all_skip_bytes() {
+        let decoder = Decoder::new64();
+        let mut iter = decoder.decode_all::<VisibleOperands>(&[ 0x06 ], 0);
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
+
+        let mut iter = decoder.decode_all_with::<VisibleOperands, _>(&[ 0x50, 0x06, 0x06, 0x50 ], 0, |s| s.skip_byte());
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(iter.next().is_none());
+
+        let mut iter = decoder.decode_all_with::<VisibleOperands, _>(&[ 0x50, 0x06, 0x06, 0x50 ], 0, |s| s.skip_bytes(2));
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(iter.next().is_none());
     }
 }
